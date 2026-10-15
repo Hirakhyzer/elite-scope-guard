@@ -13,21 +13,21 @@ export function addDays(value, days) {
   return date.toISOString().slice(0, 10);
 }
 
-export function getRequestType(typeId) {
-  return byId(REQUEST_TYPES, typeId) || REQUEST_TYPES[0];
-}
+export function getRequestType(typeId) { return byId(REQUEST_TYPES, typeId) || REQUEST_TYPES[0]; }
 
 export function bestPeople(type, team) {
-  return team
-    .map((person) => {
-      const matchCount = type.skills.filter((skill) => person.skills.includes(skill)).length;
-      const match = type.skills.length ? matchCount / type.skills.length : 0;
-      const availability = Math.max(0, person.weeklyCapacity - person.committed) / Math.max(1, person.weeklyCapacity);
-      const score = match * 75 + availability * 18 + (person.committed < person.weeklyCapacity ? 7 : 0);
-      return { ...person, match, availability, score };
-    })
-    .filter((person) => person.match > 0)
-    .sort((a, b) => b.score - a.score);
+  return team.map((person) => {
+    const matchCount = type.skills.filter((skill) => person.skills.includes(skill)).length;
+    const match = type.skills.length ? matchCount / type.skills.length : 0;
+    const availability = Math.max(0, person.weeklyCapacity - person.committed) / Math.max(1, person.weeklyCapacity);
+    return { ...person, match, availability, score: match * 75 + availability * 18 + (person.committed < person.weeklyCapacity ? 7 : 0) };
+  }).filter((person) => person.match > 0).sort((a, b) => b.score - a.score);
+}
+
+export function approvalGate(request, requiredApprovals) {
+  const approvals = request.approvals || {};
+  const missing = requiredApprovals.filter((role) => !approvals[role]);
+  return { ready: missing.length === 0, missing, approved: requiredApprovals.length - missing.length, total: requiredApprovals.length };
 }
 
 export function analyzeChange(request, project, team, baseScope) {
@@ -43,8 +43,7 @@ export function analyzeChange(request, project, team, baseScope) {
   const qaHours = Math.max(3, Math.round(coreHours * 0.2));
   const discoveryHours = request.complexity === "enterprise" ? Math.round(coreHours * 0.14) : Math.round(coreHours * 0.08);
   const totalHours = coreHours + projectManagementHours + qaHours + discoveryHours;
-  const skillRate = lead.rate;
-  const internalCost = coreHours * skillRate + projectManagementHours * pm.rate + qaHours * qa.rate + discoveryHours * pm.rate;
+  const internalCost = coreHours * lead.rate + projectManagementHours * pm.rate + qaHours * qa.rate + discoveryHours * pm.rate;
   const dependencyCount = (request.affectedScope || []).length;
   const dependencyCost = internalCost * dependencyCount * 0.035;
   const riskReservePercent = clamp(type.risk + urgency.risk + dependencyCount * 4 + (request.complexity === "enterprise" ? 9 : 0), 8, 38);
@@ -77,11 +76,17 @@ export function analyzeChange(request, project, team, baseScope) {
   const requiredApprovals = ["Project Manager", "Finance"];
   if (finalPrice >= 6000 || riskScore >= 55 || decision === "Re-quote") requiredApprovals.push("Founder");
   if (request.status === "Client Review" || request.status === "Approved") requiredApprovals.push("Client");
+  const approval = approvalGate(request, requiredApprovals);
   const affectedTasks = (request.affectedScope || []).map((id) => byId(baseScope, id)).filter(Boolean);
-  const approvalProgress = Object.values(request.approvals || {}).filter(Boolean).length;
-  const approvalTotal = requiredApprovals.length;
   const clientSummary = `${type.label} is estimated at ${totalHours} delivery hours with an implementation fee of ${money(finalPrice)}. The change is expected to require ${deliveryDays} delivery days${deadlineSlip ? ` and may move the target by ${deadlineSlip} day${deadlineSlip === 1 ? "" : "s"}` : " without moving the current target"}.`;
-  return { type, complexity, urgency, people, lead, pm, qa, coreHours, projectManagementHours, qaHours, discoveryHours, totalHours, internalCost, dependencyCost, riskReservePercent, riskReserve, totalCost, targetMargin, marginFloor, recommendedPrice, finalPrice, discount, margin, netNewProfit, deliveryDays, dependencyFinish, changeFinish, deadlineSlip, riskScore, riskBand, decision, reason, requiredApprovals, approvalProgress, approvalTotal, affectedTasks, clientSummary };
+  return { type, complexity, urgency, people, lead, pm, qa, coreHours, projectManagementHours, qaHours, discoveryHours, totalHours, internalCost, dependencyCost, riskReservePercent, riskReserve, totalCost, targetMargin, marginFloor, recommendedPrice, finalPrice, discount, margin, netNewProfit, deliveryDays, dependencyFinish, changeFinish, deadlineSlip, riskScore, riskBand, decision, reason, requiredApprovals, approvalProgress: approval.approved, approvalTotal: approval.total, approval, affectedTasks, clientSummary };
+}
+
+export function commercialSensitivity(request, project, team, baseScope, discounts = [0, 5, 10, 15, 20, 25]) {
+  return discounts.map((discount) => {
+    const analysis = analyzeChange({ ...request, discount }, project, team, baseScope);
+    return { discount, price: analysis.finalPrice, margin: analysis.margin, profit: analysis.netNewProfit, decision: analysis.decision, floorProtected: analysis.finalPrice === analysis.marginFloor };
+  });
 }
 
 export function portfolioSummary(requests, project, team, baseScope) {
@@ -91,63 +96,18 @@ export function portfolioSummary(requests, project, team, baseScope) {
   const exposure = active.reduce((sum, item) => sum + item.analysis.totalCost, 0);
   const highRisk = active.filter((item) => item.analysis.riskScore >= 55).length;
   const clientWaiting = active.filter(({ request }) => request.status === "Client Review").length;
-  return { analyses, active, approvedValue, exposure, highRisk, clientWaiting };
+  const blockedApprovals = active.filter(({ analysis }) => !analysis.approval.ready).length;
+  return { analyses, active, approvedValue, exposure, highRisk, clientWaiting, blockedApprovals };
 }
 
 export function clientSafeSummary(project, request, analysis) {
-  return {
-    project: project.name,
-    client: project.client,
-    request: request.title,
-    scope: analysis.type.description,
-    investment: money(analysis.finalPrice),
-    estimatedDelivery: `${analysis.deliveryDays} delivery days`,
-    targetImpact: analysis.deadlineSlip ? `The current target may move by ${analysis.deadlineSlip} days after approval.` : "The current target can remain unchanged with the proposed delivery plan.",
-    nextStep: analysis.decision === "Approve" ? "Review and approve the change request to begin implementation." : "Review the revised scope, investment, and delivery conditions with Elite Era Development.",
-  };
+  return { project: project.name, client: project.client, request: request.title, scope: analysis.type.description, investment: money(analysis.finalPrice), estimatedDelivery: `${analysis.deliveryDays} delivery days`, targetImpact: analysis.deadlineSlip ? `The current target may move by ${analysis.deadlineSlip} days after approval.` : "The current target can remain unchanged with the proposed delivery plan.", nextStep: analysis.decision === "Approve" ? "Review and approve the change request to begin implementation." : "Review the revised scope, investment, and delivery conditions with Elite Era Development." };
 }
 
 export function toText(project, request, analysis) {
-  return [
-    "ELITE ERA DEVELOPMENT L.L.C — SCOPE GUARD REPORT",
-    "Made by Hira Khyzer",
-    "",
-    `Project: ${project.name}`,
-    `Client: ${project.client}`,
-    `Change request: ${request.title}`,
-    `Status: ${request.status}`,
-    "",
-    "--- COMMERCIAL ANALYSIS ---",
-    `Recommended investment: ${money(analysis.finalPrice)}`,
-    `Internal delivery cost: ${money(analysis.totalCost)}`,
-    `Net new profit: ${money(analysis.netNewProfit)}`,
-    `Protected margin: ${analysis.margin.toFixed(1)}%`,
-    `Margin floor: ${money(analysis.marginFloor)}`,
-    "",
-    "--- DELIVERY ANALYSIS ---",
-    `Total effort: ${analysis.totalHours} hours`,
-    `Delivery duration: ${analysis.deliveryDays} days`,
-    `Change finish: ${analysis.changeFinish}`,
-    `Deadline slip: ${analysis.deadlineSlip} days`,
-    `Risk score: ${analysis.riskScore}/100 (${analysis.riskBand})`,
-    `Decision: ${analysis.decision}`,
-    `Reason: ${analysis.reason}`,
-    "",
-    "--- REQUIRED APPROVALS ---",
-    ...analysis.requiredApprovals.map((item) => `- ${item}`),
-    "",
-    "--- CLIENT-SAFE SUMMARY ---",
-    analysis.clientSummary,
-    "",
-  ].join("\n");
+  return ["ELITE ERA DEVELOPMENT L.L.C — SCOPE GUARD REPORT", "Made by Hira Khyzer", "", `Project: ${project.name}`, `Client: ${project.client}`, `Change request: ${request.title}`, `Status: ${request.status}`, "", "--- COMMERCIAL ANALYSIS ---", `Recommended investment: ${money(analysis.finalPrice)}`, `Internal delivery cost: ${money(analysis.totalCost)}`, `Net new profit: ${money(analysis.netNewProfit)}`, `Protected margin: ${analysis.margin.toFixed(1)}%`, `Margin floor: ${money(analysis.marginFloor)}`, "", "--- DELIVERY ANALYSIS ---", `Total effort: ${analysis.totalHours} hours`, `Delivery duration: ${analysis.deliveryDays} days`, `Change finish: ${analysis.changeFinish}`, `Deadline slip: ${analysis.deadlineSlip} days`, `Risk score: ${analysis.riskScore}/100 (${analysis.riskBand})`, `Decision: ${analysis.decision}`, `Reason: ${analysis.reason}`, "", "--- REQUIRED APPROVALS ---", ...analysis.requiredApprovals.map((item) => `- ${item}${analysis.approval.missing.includes(item) ? " — pending" : " — approved"}`), "", "--- CLIENT-SAFE SUMMARY ---", analysis.clientSummary, ""].join("\n");
 }
 
 export function downloadFile(name, content, type) {
-  const blob = new Blob([content], { type });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = name;
-  anchor.click();
-  URL.revokeObjectURL(url);
+  const blob = new Blob([content], { type }); const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = name; anchor.click(); URL.revokeObjectURL(url);
 }
